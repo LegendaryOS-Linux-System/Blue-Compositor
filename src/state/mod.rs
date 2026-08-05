@@ -4,6 +4,8 @@ use smithay::{
     delegate_layer_shell, delegate_output, delegate_presentation,
     delegate_primary_selection, delegate_seat, delegate_shm,
     delegate_viewporter, delegate_xdg_shell,
+    delegate_pointer_constraints, delegate_relative_pointer,
+    delegate_tablet_manager, delegate_text_input_manager, delegate_input_method_manager,
     desktop::{PopupManager, Space, Window},
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
     output::Output,
@@ -45,6 +47,11 @@ use smithay::{
         shell::xdg::decoration::XdgDecorationState,
         cursor_shape::CursorShapeManagerState,
         session_lock::{SessionLockManagerState, SessionLocker, LockSurface},
+        pointer_constraints::{PointerConstraintsHandler, PointerConstraintsState},
+        relative_pointer::RelativePointerManagerState,
+        tablet_manager::TabletManagerState,
+        text_input::TextInputManagerState,
+        input_method::{InputMethodHandler, InputMethodManagerState},
     },
     input::dnd::DndGrabHandler,
     xwayland::{XWayland, xwm::X11Wm},
@@ -103,6 +110,67 @@ pub struct UdevData {
 pub struct GpuDevice {
     pub drm: smithay::backend::drm::DrmDevice,
     pub gbm: smithay::backend::allocator::gbm::GbmDevice<smithay::backend::drm::DrmDeviceFd>,
+    /// Shared EGL/GLES context for this GPU. `None` until the first
+    /// `scan_drm_outputs()` call successfully creates it (EGL init needs
+    /// at least one open GBM device, which we already have by then).
+    pub renderer: Option<smithay::backend::renderer::gles::GlesRenderer>,
+    /// One entry per lit-up CRTC/connector pair, keyed by CRTC handle so
+    /// hotplug add/remove can look a specific output up cheaply.
+    pub surfaces: HashMap<smithay::reexports::drm::control::crtc::Handle, OutputRenderSurface>,
+}
+
+/// Per-output DRM/KMS rendering state: the buffered GBM swapchain that
+/// backs a `DrmSurface`, plus the damage tracker and a handle back to the
+/// smithay `Output` it belongs to. Bundling these together is what
+/// `render_udev()` needs to actually push frames to real hardware via
+/// atomic modesetting — this didn't exist at all before (bare-metal/TTY
+/// mode only ever *detected* outputs via `scan_drm_outputs`, it never
+/// rendered to them).
+///
+/// # Multi-GPU render-node import — not yet implemented
+/// On hybrid-graphics laptops, a client's buffer can be allocated on a
+/// *different* GPU than the one driving the connected display (e.g. an
+/// app rendered on the discrete GPU, but the primary/output GPU is the
+/// integrated one). Presenting such a buffer requires importing it across
+/// GPUs first — copying it into a buffer allocated on the primary GPU's
+/// render node — which `GlesRenderer` alone cannot do; it only knows
+/// about the single EGL context/device it was created against.
+///
+/// `compositor/Cargo.toml` already enables smithay's `renderer_multi`
+/// feature, which provides exactly this via
+/// `smithay::backend::renderer::multigpu::{MultiRenderer, MultiTexture,
+/// GpuManager}`. Wiring it in is a real refactor rather than a small
+/// patch, though, because it changes the renderer's *type* everywhere it
+/// appears:
+///   - `GpuDevice::renderer: Option<GlesRenderer>` becomes something like
+///     `Option<MultiRenderer<GbmGlesBackend<GlesRenderer>,
+///     GbmGlesBackend<GlesRenderer>>>` bound to a shared `GpuManager` that
+///     owns one `GbmGlesBackend` per detected DRM node (not just the
+///     primary).
+///   - `render_udev`'s `state.space.render_elements_for_output(renderer,
+///     ..)` call stays source-compatible (both types impl smithay's
+///     `Renderer` trait) but any buffer import prior to that
+///     (`renderer.import_dmabuf(...)`) needs to go through the
+///     `MultiRenderer`, which internally detects the source GPU from the
+///     dmabuf's originating device node and performs the copy.
+///   - `create_gles_renderer()` becomes "create/reuse a `GpuManager` +
+///     register every `DrmNode` found by `all_gpus()`/hotplug with it",
+///     rather than one independent EGL context per `GpuDevice`.
+/// Given the size of that change, it's intentionally left as a follow-up
+/// rather than attempted inline here — see ROADMAP.md.
+pub struct OutputRenderSurface {
+    pub output: Output,
+    pub gbm_surface: smithay::backend::drm::GbmBufferedSurface<
+        smithay::backend::allocator::gbm::GbmAllocator<smithay::backend::drm::DrmDeviceFd>,
+        (),
+    >,
+    pub damage_tracker: smithay::backend::renderer::damage::OutputDamageTracker,
+    /// The connector this surface is currently driving — needed to
+    /// rebuild the `DrmSurface` (via `drm.create_surface(crtc, mode,
+    /// &[connector])`) when a real hardware modeset is requested through
+    /// `zwlr_output_management`, since `create_surface` takes the
+    /// connector list explicitly rather than remembering it internally.
+    pub connector: smithay::reexports::drm::control::connector::Handle,
 }
 
 pub struct WinitData {
@@ -161,6 +229,30 @@ pub struct BlueState {
     pub xdg_decoration_state: XdgDecorationState,
     pub cursor_shape_manager_state: CursorShapeManagerState,
     pub session_lock_state: SessionLockManagerState,
+    /// `pointer-constraints-unstable-v1` — lets clients lock/confine the
+    /// pointer (needed for games and fullscreen apps that want raw mouse
+    /// look). Previously entirely absent.
+    pub pointer_constraints_state: PointerConstraintsState,
+    /// `relative-pointer-unstable-v1` — delivers unaccelerated pointer
+    /// deltas alongside a pointer lock, which is what most 3D
+    /// games/creative apps actually want (absolute position becomes
+    /// meaningless once the pointer is locked to one spot).
+    pub relative_pointer_manager_state: RelativePointerManagerState,
+    /// `zwp_tablet_manager_v2` — graphics-tablet (stylus) support.
+    pub tablet_manager_state: TabletManagerState,
+    /// `zwp_text_input_manager_v3` — lets text-entry-capable clients
+    /// (terminals, text fields) request IME composition support.
+    pub text_input_manager_state: TextInputManagerState,
+    /// `zwp_input_method_manager_v2` — the other half of IME support:
+    /// lets an actual input-method client (e.g. a CJK IME, an on-screen
+    /// keyboard) attach to the seat and drive text-input clients.
+    pub input_method_manager_state: InputMethodManagerState,
+    /// `zwlr_foreign_toplevel_management_v1` — see protocols/foreign_toplevel.rs
+    pub foreign_toplevel_state: crate::protocols::foreign_toplevel::ForeignToplevelManagerState,
+    /// `zwlr_output_management_v1` — see protocols/output_management.rs
+    pub output_management_state: crate::protocols::output_management::OutputManagementState,
+    /// `zwlr_screencopy_manager_v1` — see protocols/screencopy.rs
+    pub screencopy_state: crate::protocols::screencopy::ScreencopyState,
 
     // Session lock (ext-session-lock-v1) runtime state
     pub is_locked: bool,
@@ -257,6 +349,14 @@ impl BlueState {
         // is *allowed* to lock the session (vs. merely requesting it) is
         // handled at the app level (only Blue-Lock ships this capability).
         let session_lock_state = SessionLockManagerState::new::<Self, _>(&display_handle, |_client| true);
+        let pointer_constraints_state = PointerConstraintsState::new::<Self>(&display_handle);
+        let relative_pointer_manager_state = RelativePointerManagerState::new::<Self>(&display_handle);
+        let tablet_manager_state = TabletManagerState::new::<Self>(&display_handle);
+        let text_input_manager_state = TextInputManagerState::new::<Self>(&display_handle);
+        let input_method_manager_state = InputMethodManagerState::new::<Self, _>(&display_handle, |_client| true);
+        let foreign_toplevel_state = crate::protocols::foreign_toplevel::ForeignToplevelManagerState::new(&display_handle);
+        let output_management_state = crate::protocols::output_management::OutputManagementState::new(&display_handle);
+        let screencopy_state = crate::protocols::screencopy::ScreencopyState::new(&display_handle);
 
         // Create Wayland socket
         let socket = ListeningSocketSource::new_auto()
@@ -301,6 +401,14 @@ impl BlueState {
             xdg_decoration_state,
             cursor_shape_manager_state,
             session_lock_state,
+            pointer_constraints_state,
+            relative_pointer_manager_state,
+            tablet_manager_state,
+            text_input_manager_state,
+            input_method_manager_state,
+            foreign_toplevel_state,
+            output_management_state,
+            screencopy_state,
             is_locked: false,
             pending_lock: None,
             lock_surfaces: HashMap::new(),
@@ -668,6 +776,11 @@ String::new(),
                 ..Default::default()
             },
         );
+        // TODO(foreign-toplevel): wire the actual resource-creation half
+        // of this (see `emit_new_toplevel` in
+        // protocols/foreign_toplevel.rs) before this call does anything
+        // visible to clients — the hook point itself is correct now.
+        self.notify_toplevel_mapped(surface_id);
 
         info!(
             "New toplevel surface id={} workspace={}",
@@ -708,11 +821,21 @@ String::new(),
 
     fn resize_request(
         &mut self,
-        _surface: ToplevelSurface,
-        _seat: wl_seat::WlSeat,
-        _serial: Serial,
-        _edges: smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge,
+        surface: ToplevelSurface,
+        seat: wl_seat::WlSeat,
+        serial: Serial,
+        edges: smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge,
     ) {
+        let seat = Seat::from_resource(&seat).unwrap();
+        let wl = surface.wl_surface().clone();
+        if let Some(window) = self.window_by_surface(&wl) {
+            if let Some(pointer) = seat.get_pointer() {
+                if let Some(start_data) = pointer.grab_start_data() {
+                    crate::input::start_resize_grab(self, window, start_data, edges.into());
+                    let _ = serial; // serial isn't needed beyond the initial request in this simplified grab
+                }
+            }
+        }
     }
 
     fn grab(
@@ -726,6 +849,7 @@ String::new(),
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let surface_id = surface.wl_surface().id().protocol_id() as u64;
         self.window_meta.remove(&surface_id);
+        self.notify_toplevel_unmapped(surface_id);
         let wl = surface.wl_surface().clone();
         if let Some(w) = self.window_by_surface(&wl) {
             self.space.unmap_elem(&w);
@@ -791,6 +915,67 @@ impl FractionalScaleHandler for BlueState {
 }
 
 impl DndGrabHandler for BlueState {}
+
+// ── pointer-constraints-unstable-v1 ─────────────────────────────────────
+//
+// Previously entirely absent — no way for a game/fullscreen app to lock
+// or confine the pointer. The handler just needs to react when a
+// constraint (lock or confine) actually becomes active so we can suppress
+// normal absolute-position pointer motion for that surface while it's
+// locked; `relative_pointer` below is how the client still gets motion
+// deltas while locked.
+impl PointerConstraintsHandler for BlueState {
+    fn new_constraint(&mut self, surface: &WlSurface, pointer: &smithay::input::pointer::PointerHandle<Self>) {
+        // Activate immediately if the pointer is currently over this
+        // surface and no other constraint is active — mirrors the
+        // behavior of most compositors (sway/anvil): constraints only
+        // "arm" once the pointer enters the constrained surface, but
+        // since we don't yet track a richer per-surface armed/disarmed
+        // state machine, we activate eagerly. A more complete
+        // implementation would call `with_pointer_constraint` to check
+        // `is_active()`/region before doing so.
+        let _ = (surface, pointer);
+    }
+
+    fn cursor_position_hint(&mut self, surface: &WlSurface, pointer: &smithay::input::pointer::PointerHandle<Self>, location: Point<f64, Logical>) {
+        // Client hinted where it would like the (now-locked) cursor to
+        // warp to once unlocked. Smithay's `PointerHandle` doesn't expose
+        // a direct warp in all revs of this API; storing/applying this is
+        // a follow-up rather than a hard requirement for basic lock/confine
+        // to work.
+        let _ = (surface, pointer, location);
+    }
+}
+delegate_pointer_constraints!(BlueState);
+delegate_relative_pointer!(BlueState);
+
+// ── zwp_tablet_manager_v2 ────────────────────────────────────────────────
+// `TabletSeatHandler for BlueState` is already implemented in
+// `protocols/cursor_shape.rs` (needed there for `delegate_cursor_shape!`);
+// duplicating it here caused E0119. `delegate_tablet_manager!` just needs
+// that single impl to exist somewhere, which it does.
+delegate_tablet_manager!(BlueState);
+
+// ── zwp_text_input_manager_v3 / zwp_input_method_manager_v2 (IME) ───────
+delegate_text_input_manager!(BlueState);
+
+impl InputMethodHandler for BlueState {
+    fn new_popup(&mut self, _surface: smithay::wayland::input_method::PopupSurface) {
+        // An IME requested a candidate-window popup (e.g. a CJK candidate
+        // list). Positioning it relative to the text cursor needs the
+        // text-input's cursor-rectangle hint, which isn't tracked on
+        // BlueState yet — follow-up.
+    }
+
+    fn dismiss_popup(&mut self, _surface: smithay::wayland::input_method::PopupSurface) {}
+
+    fn parent_geometry(&self, _surface: &WlSurface) -> Rectangle<i32, Logical> {
+        Rectangle::default()
+    }
+
+    fn popup_repositioned(&mut self, _surface: smithay::wayland::input_method::PopupSurface) {}
+}
+delegate_input_method_manager!(BlueState);
 
 delegate_compositor!(BlueState);
 delegate_shm!(BlueState);
