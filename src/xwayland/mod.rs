@@ -110,6 +110,7 @@ impl smithay::xwayland::xwm::XwmHandler for BlueState {
                 workspace: self.current_workspace,
                 ..Default::default()
             });
+            self.notify_toplevel_mapped(sid);
         }
     }
 
@@ -125,7 +126,9 @@ impl smithay::xwayland::xwm::XwmHandler for BlueState {
             .find(|w| w.x11_surface().map(|x| x == &window).unwrap_or(false))
             .cloned();
         if let Some(w) = found {
-            self.window_meta.remove(&BlueState::window_id(&w));
+            let id = BlueState::window_id(&w);
+            self.window_meta.remove(&id);
+            self.notify_toplevel_unmapped(id);
             self.space.unmap_elem(&w);
         }
     }
@@ -135,7 +138,9 @@ impl smithay::xwayland::xwm::XwmHandler for BlueState {
             .find(|w| w.x11_surface().map(|x| x == &window).unwrap_or(false))
             .cloned();
         if let Some(w) = found {
-            self.window_meta.remove(&BlueState::window_id(&w));
+            let id = BlueState::window_id(&w);
+            self.window_meta.remove(&id);
+            self.notify_toplevel_unmapped(id);
             self.space.unmap_elem(&w);
         }
     }
@@ -160,8 +165,37 @@ impl smithay::xwayland::xwm::XwmHandler for BlueState {
         if let Some(w) = found { self.space.map_element(w, geo.loc, false); }
     }
 
-    fn resize_request(&mut self, _: XwmId, _: X11Surface, _: u32, _: X11ResizeEdge) {}
-    fn move_request(&mut self, _: XwmId, _: X11Surface, _: u32) {}
+    fn resize_request(&mut self, _: XwmId, window: X11Surface, _button: u32, edge: X11ResizeEdge) {
+        let Some(pointer) = self.seat.get_pointer() else { return };
+        let Some(start_data) = pointer.grab_start_data() else {
+            warn!("X11 resize_request with no active pointer grab, ignoring");
+            return;
+        };
+        let found: Option<Window> = self
+            .space
+            .elements()
+            .find(|w| w.x11_surface().map(|x| x == &window).unwrap_or(false))
+            .cloned();
+        if let Some(win) = found {
+            crate::input::start_resize_grab(self, win, start_data, edge.into());
+        }
+    }
+
+    fn move_request(&mut self, _: XwmId, window: X11Surface, _button: u32) {
+        let Some(pointer) = self.seat.get_pointer() else { return };
+        let Some(start_data) = pointer.grab_start_data() else {
+            warn!("X11 move_request with no active pointer grab, ignoring");
+            return;
+        };
+        let found: Option<Window> = self
+            .space
+            .elements()
+            .find(|w| w.x11_surface().map(|x| x == &window).unwrap_or(false))
+            .cloned();
+        if let Some(win) = found {
+            crate::input::start_move_grab(self, win, start_data, smithay::utils::SERIAL_COUNTER.next_serial());
+        }
+    }
     fn send_selection(&mut self, _: XwmId, _: SelectionTarget, _: String, _: OwnedFd) {}
     fn allow_selection_access(&mut self, _: XwmId, _: SelectionTarget) -> bool { true }
     fn new_selection(&mut self, _: XwmId, _: SelectionTarget, _: Vec<String>) {}
