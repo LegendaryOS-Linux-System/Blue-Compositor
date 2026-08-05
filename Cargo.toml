@@ -24,6 +24,7 @@ smithay = { git = "https://github.com/Smithay/smithay.git", rev = "82912edf", de
 ] }
 
 wayland-protocols = { version = "0.31", features = ["server", "staging", "unstable"] }
+wayland-protocols-wlr = { version = "0.2", features = ["server"] }
 wayland-server = "0.31"
 calloop = { version = "0.14", features = ["executor"] }
 tracing = "0.1"
