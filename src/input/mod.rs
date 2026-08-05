@@ -15,7 +15,7 @@ use smithay::{
         },
     },
     reexports::wayland_server::protocol::wl_surface::WlSurface,
-    utils::{Logical, Point, Size, SERIAL_COUNTER},
+    utils::{Logical, Point, Rectangle, Size, SERIAL_COUNTER},
     wayland::seat::WaylandFocus,
 };
 
@@ -513,4 +513,247 @@ pub fn start_move_grab(
         SERIAL_COUNTER.next_serial(),
         smithay::input::pointer::Focus::Clear,
     );
+}
+
+// ── Resize grab ───────────────────────────────────────────────────────────
+//
+// Previously `resize_request` was a no-op stub for both xdg-shell toplevels
+// (state/mod.rs) and XWayland/X11 windows (xwayland/mod.rs) — dragging a
+// window's edge/corner from a client-side decoration or the compositor's
+// own titlebar did nothing. This mirrors the existing `MoveGrab` pattern.
+//
+// Note on correctness: for xdg-shell toplevels the "proper" way to handle
+// north/west edge resizes is to let the client ack the new size via
+// `xdg_surface.configure` and only reposition the window once the new
+// buffer has actually committed (otherwise the window can visually jitter
+// for a frame or two while the client catches up). This implementation
+// takes the simpler approach of resizing eagerly, which is a large
+// functional improvement over "resize does nothing at all" and matches
+// what many lightweight compositors do, but a follow-up could track
+// pending-size-vs-committed-size per window for pixel-perfect behavior.
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResizeEdges {
+    pub top: bool,
+    pub bottom: bool,
+    pub left: bool,
+    pub right: bool,
+}
+
+impl From<smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge> for ResizeEdges {
+    fn from(e: smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge) -> Self {
+        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge as E;
+        match e {
+            E::Top => Self { top: true, ..Default::default() },
+            E::Bottom => Self { bottom: true, ..Default::default() },
+            E::Left => Self { left: true, ..Default::default() },
+            E::Right => Self { right: true, ..Default::default() },
+            E::TopLeft => Self { top: true, left: true, ..Default::default() },
+            E::TopRight => Self { top: true, right: true, ..Default::default() },
+            E::BottomLeft => Self { bottom: true, left: true, ..Default::default() },
+            E::BottomRight => Self { bottom: true, right: true, ..Default::default() },
+            _ => Self::default(),
+        }
+    }
+}
+
+impl From<smithay::xwayland::xwm::ResizeEdge> for ResizeEdges {
+    // smithay's X11 `ResizeEdge` variant names have shifted a bit across
+    // revisions; matched defensively with a wildcard fallback so this
+    // keeps compiling even if the pinned rev's variant set differs
+    // slightly (worst case: an unrecognized edge falls back to a
+    // bottom-right resize, which is the most common default anyway).
+    fn from(e: smithay::xwayland::xwm::ResizeEdge) -> Self {
+        use smithay::xwayland::xwm::ResizeEdge as E;
+        match e {
+            E::Top => Self { top: true, ..Default::default() },
+            E::Bottom => Self { bottom: true, ..Default::default() },
+            E::Left => Self { left: true, ..Default::default() },
+            E::Right => Self { right: true, ..Default::default() },
+            E::TopLeft => Self { top: true, left: true, ..Default::default() },
+            E::TopRight => Self { top: true, right: true, ..Default::default() },
+            E::BottomLeft => Self { bottom: true, left: true, ..Default::default() },
+            E::BottomRight => Self { bottom: true, right: true, ..Default::default() },
+            #[allow(unreachable_patterns)]
+            _ => Self { bottom: true, right: true, ..Default::default() },
+        }
+    }
+}
+
+pub struct ResizeGrab {
+    pub start_data: PointerGrabStartData<BlueState>,
+    pub window: smithay::desktop::Window,
+    pub edges: ResizeEdges,
+    pub initial_window_location: Point<i32, Logical>,
+    pub initial_window_size: Size<i32, Logical>,
+}
+
+const MIN_WINDOW_SIZE: i32 = 32;
+
+impl PointerGrab<BlueState> for ResizeGrab {
+    fn motion(
+        &mut self,
+        data: &mut BlueState,
+        handle: &mut PointerInnerHandle<'_, BlueState>,
+        _focus: Option<(WlSurface, Point<f64, Logical>)>,
+        event: &MotionEvent,
+    ) {
+        handle.motion(data, None, event);
+        let delta = (event.location - self.start_data.location).to_i32_round::<i32>();
+
+        let mut new_w = self.initial_window_size.w;
+        let mut new_h = self.initial_window_size.h;
+        let mut new_x = self.initial_window_location.x;
+        let mut new_y = self.initial_window_location.y;
+
+        if self.edges.right {
+            new_w = (self.initial_window_size.w + delta.x).max(MIN_WINDOW_SIZE);
+        } else if self.edges.left {
+            new_w = (self.initial_window_size.w - delta.x).max(MIN_WINDOW_SIZE);
+            new_x = self.initial_window_location.x + (self.initial_window_size.w - new_w);
+        }
+        if self.edges.bottom {
+            new_h = (self.initial_window_size.h + delta.y).max(MIN_WINDOW_SIZE);
+        } else if self.edges.top {
+            new_h = (self.initial_window_size.h - delta.y).max(MIN_WINDOW_SIZE);
+            new_y = self.initial_window_location.y + (self.initial_window_size.h - new_h);
+        }
+
+        let new_size = Size::from((new_w, new_h));
+        let new_loc = Point::from((new_x, new_y));
+        apply_resize(data, &self.window, new_loc, new_size, self.edges);
+    }
+
+    fn relative_motion(
+        &mut self,
+        data: &mut BlueState,
+        handle: &mut PointerInnerHandle<'_, BlueState>,
+        focus: Option<(WlSurface, Point<f64, Logical>)>,
+        event: &RelativeMotionEvent,
+    ) {
+        handle.relative_motion(data, focus, event);
+    }
+
+    fn button(
+        &mut self,
+        data: &mut BlueState,
+        handle: &mut PointerInnerHandle<'_, BlueState>,
+        event: &ButtonEvent,
+    ) {
+        handle.button(data, event);
+        if event.state == ButtonState::Released {
+            handle.unset_grab(self, data, event.serial, event.time, true);
+        }
+    }
+
+    fn axis(
+        &mut self,
+        data: &mut BlueState,
+        handle: &mut PointerInnerHandle<'_, BlueState>,
+        details: AxisFrame,
+    ) {
+        handle.axis(data, details);
+    }
+
+    fn frame(&mut self, data: &mut BlueState, handle: &mut PointerInnerHandle<'_, BlueState>) {
+        handle.frame(data);
+    }
+
+    fn gesture_swipe_begin(&mut self, _: &mut BlueState, _: &mut PointerInnerHandle<'_, BlueState>, _: &smithay::input::pointer::GestureSwipeBeginEvent) {}
+    fn gesture_swipe_update(&mut self, _: &mut BlueState, _: &mut PointerInnerHandle<'_, BlueState>, _: &smithay::input::pointer::GestureSwipeUpdateEvent) {}
+    fn gesture_swipe_end(&mut self, _: &mut BlueState, _: &mut PointerInnerHandle<'_, BlueState>, _: &smithay::input::pointer::GestureSwipeEndEvent) {}
+    fn gesture_pinch_begin(&mut self, _: &mut BlueState, _: &mut PointerInnerHandle<'_, BlueState>, _: &smithay::input::pointer::GesturePinchBeginEvent) {}
+    fn gesture_pinch_update(&mut self, _: &mut BlueState, _: &mut PointerInnerHandle<'_, BlueState>, _: &smithay::input::pointer::GesturePinchUpdateEvent) {}
+    fn gesture_pinch_end(&mut self, _: &mut BlueState, _: &mut PointerInnerHandle<'_, BlueState>, _: &smithay::input::pointer::GesturePinchEndEvent) {}
+    fn gesture_hold_begin(&mut self, _: &mut BlueState, _: &mut PointerInnerHandle<'_, BlueState>, _: &smithay::input::pointer::GestureHoldBeginEvent) {}
+    fn gesture_hold_end(&mut self, _: &mut BlueState, _: &mut PointerInnerHandle<'_, BlueState>, _: &smithay::input::pointer::GestureHoldEndEvent) {}
+
+    fn start_data(&self) -> &PointerGrabStartData<BlueState> {
+        &self.start_data
+    }
+
+    fn unset(&mut self, _: &mut BlueState) {}
+}
+
+/// Pushes a resized geometry to whichever kind of window this is —
+/// xdg-shell toplevel (via a new configure) or an XWayland/X11 window
+/// (via a direct `configure()`, since X11 has no client-ack round trip).
+fn apply_resize(
+    state: &mut BlueState,
+    window: &smithay::desktop::Window,
+    new_loc: Point<i32, Logical>,
+    new_size: Size<i32, Logical>,
+    edges: ResizeEdges,
+) {
+    if let Some(toplevel) = window.toplevel() {
+        toplevel.with_pending_state(|s| {
+            s.size = Some(new_size);
+        });
+        toplevel.send_configure();
+        // Only reposition eagerly for edges that move the window's origin
+        // (top/left) — the alternative (waiting for the client's next
+        // commit) is more correct but requires per-window pending-state
+        // tracking that doesn't exist yet.
+        if edges.top || edges.left {
+            state.space.map_element(window.clone(), new_loc, false);
+        }
+    } else if let Some(x11) = window.x11_surface() {
+        let geo = Rectangle::new(new_loc, new_size);
+        if let Err(e) = x11.configure(geo) {
+            tracing::warn!("X11 resize configure failed: {}", e);
+        }
+        state.space.map_element(window.clone(), new_loc, false);
+    }
+}
+
+pub fn start_resize_grab(
+    state: &mut BlueState,
+    window: smithay::desktop::Window,
+    start_data: PointerGrabStartData<BlueState>,
+    edges: ResizeEdges,
+) {
+    let initial_window_location = state.space.element_location(&window).unwrap_or_default();
+    let initial_window_size = window.geometry().size;
+
+    let grab = ResizeGrab {
+        start_data,
+        window,
+        edges,
+        initial_window_location,
+        initial_window_size,
+    };
+
+    state.seat.get_pointer().unwrap().set_grab(
+        state,
+        grab,
+        SERIAL_COUNTER.next_serial(),
+        smithay::input::pointer::Focus::Clear,
+    );
+}
+
+#[cfg(test)]
+mod resize_edges_tests {
+    use super::ResizeEdges;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::ResizeEdge as XdgEdge;
+
+    #[test]
+    fn xdg_single_edges_map_correctly() {
+        assert_eq!(ResizeEdges::from(XdgEdge::Top), ResizeEdges { top: true, bottom: false, left: false, right: false });
+        assert_eq!(ResizeEdges::from(XdgEdge::Bottom), ResizeEdges { top: false, bottom: true, left: false, right: false });
+        assert_eq!(ResizeEdges::from(XdgEdge::Left), ResizeEdges { top: false, bottom: false, left: true, right: false });
+        assert_eq!(ResizeEdges::from(XdgEdge::Right), ResizeEdges { top: false, bottom: false, left: false, right: true });
+    }
+
+    #[test]
+    fn xdg_corner_edges_set_two_flags() {
+        assert_eq!(ResizeEdges::from(XdgEdge::TopLeft), ResizeEdges { top: true, left: true, bottom: false, right: false });
+        assert_eq!(ResizeEdges::from(XdgEdge::TopRight), ResizeEdges { top: true, right: true, bottom: false, left: false });
+        assert_eq!(ResizeEdges::from(XdgEdge::BottomLeft), ResizeEdges { bottom: true, left: true, top: false, right: false });
+        assert_eq!(ResizeEdges::from(XdgEdge::BottomRight), ResizeEdges { bottom: true, right: true, top: false, left: false });
+    }
+
+    #[test]
+    fn xdg_none_edge_sets_no_flags() {
+        assert_eq!(ResizeEdges::from(XdgEdge::None), ResizeEdges::default());
+    }
 }
