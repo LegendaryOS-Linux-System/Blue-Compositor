@@ -141,10 +141,38 @@ pub fn handle_shell_message(state: &mut BlueState, msg: ShellMessage) {
 
         ShellMessage::TakeScreenshot { path, mode } => {
             let clients = state.clients.clone();
+            // Previously "focused" mode shelled out to `swaymsg -t
+            // get_tree | jq ...` — that's sway's own IPC protocol, which
+            // Blue Compositor does not (and will never) implement, so
+            // this branch was guaranteed to fail on every single
+            // invocation, silently falling through to the `grim`
+            // (full-output) fallback below it. Compute the focused
+            // window's geometry natively from `state.space` instead —
+            // this compositor already tracks focus via `state.seat`, so
+            // there's no reason to shell out to another compositor's
+            // IPC for information we already have.
+            let focused_geo: Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>> =
+                if mode == "focused" {
+                    state
+                        .seat
+                        .get_keyboard()
+                        .and_then(|kb| kb.current_focus())
+                        .and_then(|surface| state.window_by_surface(&surface))
+                        .and_then(|window| state.space.element_geometry(&window))
+                } else {
+                    None
+                };
             std::thread::spawn(move || {
-                let cmd = match mode.as_str() {
-                    "focused" => format!("grim -g \"$(swaymsg -t get_tree | jq -r '.. | select(.focused?) | .rect | \"\\(.x),\\(.y) \\(.width)x\\(.height)\"')\" {} 2>/dev/null", path),
-                    _         => format!("grim {} 2>/dev/null || import -window root {} 2>/dev/null", path, path),
+                let cmd = match focused_geo {
+                    Some(geo) => format!(
+                        "grim -g '{},{} {}x{}' {} 2>/dev/null",
+                        geo.loc.x, geo.loc.y, geo.size.w, geo.size.h, path
+                    ),
+                    // Either full-output mode was requested, or
+                    // "focused" was requested but nothing currently has
+                    // keyboard focus (e.g. empty desktop) — fall back to
+                    // capturing everything, same as before.
+                    None => format!("grim {} 2>/dev/null || import -window root {} 2>/dev/null", path, path),
                 };
                 let ok = std::process::Command::new("sh").arg("-c").arg(&cmd).status()
                     .map(|s| s.success()).unwrap_or(false);
