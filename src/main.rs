@@ -89,12 +89,47 @@ fn main() {
 fn run_udev() {
     use smithay::backend::session::libseat::LibSeatSession;
 
+    // `LibSeatSession` (this whole function) goes through libseat, which
+    // is itself a seat-management abstraction with *two* real backends:
+    // systemd-logind (talks to org.freedesktop.login1 over D-Bus — no
+    // extra daemon needed, just systemd itself) and seatd (a standalone
+    // daemon, for non-systemd systems or systemd setups without a login1
+    // session). libseat already auto-selects between them at the C
+    // library level — nothing in this function needs to branch on it —
+    // but the compositor was previously silent about *which* one it'll
+    // get, and its one-size-fits-all failure message ("install seatd")
+    // was actively wrong advice on a systemd-logind system where seatd
+    // was never the problem in the first place. This detects which path
+    // is actually available up front so both the success log line and
+    // any failure message are accurate for the system actually running.
+    let has_systemd = std::path::Path::new("/run/systemd/system").exists();
+    let has_logind_session = has_systemd && std::env::var("XDG_SESSION_ID").is_ok();
+    let has_seatd_socket = std::path::Path::new("/run/seatd.sock").exists();
+
+    if has_logind_session {
+        info!("systemd-logind session detected (XDG_SESSION_ID set) — libseat will use it, no seatd needed");
+    } else if has_seatd_socket {
+        info!("No systemd-logind session found — using seatd ({})", "/run/seatd.sock");
+    } else if has_systemd {
+        info!("systemd is running but no XDG_SESSION_ID is set (not launched from a logind session) \
+               and no seatd socket found — session setup will likely fail. \
+               Launch from a logind session (e.g. a logind-managed TTY login) or start seatd.");
+    } else {
+        info!("No systemd detected — this requires seatd (no /run/seatd.sock found yet; is it running?)");
+    }
+
     let (session, notifier) = match LibSeatSession::new() {
         Ok(s) => s,
         Err(e) => {
             error!("Failed to create libseat session: {}", e);
-            error!("Make sure seatd is running: sudo systemctl enable --now seatd");
-            error!("And add yourself to seat group: sudo usermod -aG seat $USER");
+            if has_systemd {
+                error!("This system has systemd — either:");
+                error!("  run from a real logind session (log in via a display/login manager or a TTY logind handles), or");
+                error!("  install and enable seatd: sudo systemctl enable --now seatd, then add yourself to its group: sudo usermod -aG seat $USER");
+            } else {
+                error!("No systemd on this system — seatd is required: sudo systemctl enable --now seatd (or the equivalent for your init system)");
+                error!("And add yourself to seat group: sudo usermod -aG seat $USER");
+            }
             std::process::exit(1);
         }
     };
