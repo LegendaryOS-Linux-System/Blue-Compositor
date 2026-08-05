@@ -4,6 +4,9 @@ pub mod hotplug;
 pub mod decoration;
 pub mod cursor_shape;
 pub mod session_lock;
+pub mod foreign_toplevel;
+pub mod output_management;
+pub mod screencopy;
 
 use smithay::{
     delegate_xdg_activation,
