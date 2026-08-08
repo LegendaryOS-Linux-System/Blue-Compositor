@@ -200,5 +200,20 @@ pub fn handle_shell_message(state: &mut BlueState, msg: ShellMessage) {
 
         ShellMessage::ReloadConfig => { info!("Config reload requested"); }
         ShellMessage::GetWindowList => { /* emitted on next poll tick */ }
+        ShellMessage::SetHdrEnabled { output, enabled } => {
+            // Negotiation-side plumbing exists (protocols/color_management.rs);
+            // actually switching the output's active mode/plane to a
+            // 10-bit HDR-capable format is the render_udev format-list
+            // work already in place (see render/mod.rs), but there's no
+            // per-output override wired from here into that yet — this
+            // acknowledges the request over IPC so the shell's toggle
+            // doesn't silently do nothing, without pretending the full
+            // pipeline is connected end to end.
+            info!("HDR {} requested for output {output} (negotiation path implemented; render tone-mapping is still a stub — see color_management.rs)", if enabled { "enable" } else { "disable" });
+            state.ipc_broadcast(crate::ipc::messages::CompositorMessage::HdrStateChanged {
+                output,
+                hdr_active: false,
+            });
+        }
     }
 }
