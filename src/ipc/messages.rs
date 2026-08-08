@@ -20,6 +20,18 @@ pub enum CompositorMessage {
     IdleChanged       { idle: bool },
     ScreenshotReady   { path: String },
     Error             { message: String },
+    /// IME candidate-window (popup) visibility/position — informational
+    /// only; the candidate *content* is always the IME's own composited
+    /// surface (see protocols/input_method.rs), never drawn by the
+    /// shell. Lets the shell avoid overlapping that screen region with
+    /// its own chrome, or draw a subtle boundary around it.
+    ImeCandidateWindow { visible: bool, x: i32, y: i32, width: u32, height: u32 },
+    /// HDR state changed for an output — either the user toggled it via
+    /// `ShellMessage::SetHdrEnabled`, or (once render/mod.rs's
+    /// tone-mapping stub is implemented, see protocols/color_management.rs
+    /// module doc) a client's negotiated image description made it
+    /// available automatically.
+    HdrStateChanged   { output: String, hdr_active: bool },
 }
 
 /// Messages FROM shell TO compositor.
@@ -44,4 +56,10 @@ pub enum ShellMessage {
     SetKeyboardLayout      { layout: String, variant: Option<String> },
     SetCursor              { theme: String, size: u32 },
     ReloadConfig,
+    /// User toggled "HDR" in the shell's Monitors settings section
+    /// (`MonitorsSection.svelte`). See `HdrStateChanged` for the
+    /// compositor's reply and protocols/color_management.rs for how
+    /// far the negotiation side of this currently reaches (parametric
+    /// only; render-side tone-mapping is still a stub).
+    SetHdrEnabled          { output: String, enabled: bool },
 }
