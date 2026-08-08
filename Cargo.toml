@@ -8,7 +8,34 @@ description = "Blue Environment — Production Wayland Compositor (Smithay)"
 name = "blue-compositor"
 path = "src/main.rs"
 
+# `wp_color_management_v1` landed in upstream wayland-protocols on
+# 2025-02-13 (release 1.41) and, as of this writing, still has no bindings
+# in the `wayland-protocols` *Rust crate* (checked crates.io versions
+# 0.31.0/0.31.2/0.32.1/0.32.4 — none contain it). Until that catches up,
+# it's vendored directly from upstream (protocols-xml/) and compiled via
+# `wayland-scanner`'s `generate_server_code!`/`generate_interfaces!`
+# proc-macros, invoked directly from src/protocols/color_management.rs —
+# NOT a build.rs step. (An earlier pass here tried the old build.rs +
+# `wayland_scanner::generate_code`/`Side` function-based API, which
+# belongs to wayland-scanner <= 0.29; 0.31 replaced it with the
+# macro-based API these macros use, so it must be a normal `[dependencies]`
+# entry, not `[build-dependencies]` — the macros expand while *this*
+# crate's own source is compiled, not in a separate build-script pass.)
+# See src/protocols/color_management.rs for the (intentionally
+# scoped-down) implementation.
+#
+# The macros' generated code references `wayland_backend::protocol::
+# Interface` and core-protocol interface consts (`WL_OUTPUT_INTERFACE`
+# etc.) by direct crate path, not through `wayland_server::backend` —
+# Rust's extern prelude only makes a crate nameable that way if it's a
+# *direct* dependency of this crate, not a transitive one, so
+# `wayland-backend` has to be listed here explicitly even though nothing
+# in our own code refers to it directly. Pinned to match the version
+# `wayland-server` 0.31.14 itself depends on (checked its Cargo.toml)
+# so cargo doesn't have to unify two different semver-compatible ranges.
 [dependencies]
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
 smithay = { git = "https://github.com/Smithay/smithay.git", rev = "82912edf", default-features = false, features = [
     "backend_winit",
     "backend_udev",
