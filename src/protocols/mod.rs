@@ -7,6 +7,19 @@ pub mod session_lock;
 pub mod foreign_toplevel;
 pub mod output_management;
 pub mod screencopy;
+/// `zwp_linux_dmabuf_v1` — see dmabuf.rs module doc for why this global
+/// didn't exist at all before this pass, and its relation to the
+/// separate, still-blocked scanout-side modifier limitation documented
+/// in `render/mod.rs`.
+pub mod dmabuf;
+/// IME candidate-window popup positioning/rendering — the actual
+/// remaining gap in "ibus/fcitx5 support", since the wire-protocol
+/// managers were already registered. See module doc.
+pub mod input_method;
+/// `wp_color_management_v1` (HDR / wide-gamut negotiation) — hand-vendored
+/// protocol, parametric path only. See module doc for scope + the
+/// verification caveat (never compiled with an MSRV-matching toolchain).
+pub mod color_management;
 
 use smithay::{
     delegate_xdg_activation,
