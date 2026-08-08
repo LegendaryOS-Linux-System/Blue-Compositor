@@ -6,7 +6,7 @@ use smithay::{
     delegate_viewporter, delegate_xdg_shell,
     delegate_pointer_constraints, delegate_relative_pointer,
     delegate_tablet_manager, delegate_text_input_manager, delegate_input_method_manager,
-    desktop::{PopupManager, Space, Window},
+    desktop::{layer_map_for_output, PopupManager, Space, Window},
     input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
     output::Output,
     reexports::{
@@ -105,6 +105,11 @@ pub struct UdevData {
     pub session: smithay::backend::session::libseat::LibSeatSession,
     pub primary_gpu: smithay::backend::drm::DrmNode,
     pub devices: HashMap<smithay::backend::drm::DrmNode, GpuDevice>,
+    /// Shared across every GPU node this compositor knows about — see
+    /// `render/multigpu.rs`'s module doc for the lifecycle (registered on
+    /// `open_gpu()` success, deregistered on `UdevEvent::Removed`) and
+    /// for what cross-GPU import is/isn't wired up yet.
+    pub gpu_manager: smithay::backend::renderer::multigpu::GpuManager<crate::render::multigpu::Backend>,
 }
 
 pub struct GpuDevice {
@@ -114,6 +119,11 @@ pub struct GpuDevice {
     /// `scan_drm_outputs()` call successfully creates it (EGL init needs
     /// at least one open GBM device, which we already have by then).
     pub renderer: Option<smithay::backend::renderer::gles::GlesRenderer>,
+    /// HDR tone-mapping shader, compiled once for this GPU's GL context
+    /// right after `renderer` is created — see `render/hdr_shader.rs`'s
+    /// module doc for why it's compiled-and-ready but not yet called
+    /// from anywhere in the composite pass.
+    pub hdr_tonemap_shader: Option<smithay::backend::renderer::gles::GlesTexProgram>,
     /// One entry per lit-up CRTC/connector pair, keyed by CRTC handle so
     /// hotplug add/remove can look a specific output up cheaply.
     pub surfaces: HashMap<smithay::reexports::drm::control::crtc::Handle, OutputRenderSurface>,
@@ -127,37 +137,34 @@ pub struct GpuDevice {
 /// mode only ever *detected* outputs via `scan_drm_outputs`, it never
 /// rendered to them).
 ///
-/// # Multi-GPU render-node import — not yet implemented
+/// # Multi-GPU render-node import
 /// On hybrid-graphics laptops, a client's buffer can be allocated on a
 /// *different* GPU than the one driving the connected display (e.g. an
 /// app rendered on the discrete GPU, but the primary/output GPU is the
 /// integrated one). Presenting such a buffer requires importing it across
-/// GPUs first — copying it into a buffer allocated on the primary GPU's
-/// render node — which `GlesRenderer` alone cannot do; it only knows
-/// about the single EGL context/device it was created against.
+/// GPUs first — copying it into a buffer usable on the primary GPU —
+/// which `GlesRenderer` alone cannot do; it only knows about the single
+/// EGL context/device it was created against.
 ///
-/// `compositor/Cargo.toml` already enables smithay's `renderer_multi`
-/// feature, which provides exactly this via
-/// `smithay::backend::renderer::multigpu::{MultiRenderer, MultiTexture,
-/// GpuManager}`. Wiring it in is a real refactor rather than a small
-/// patch, though, because it changes the renderer's *type* everywhere it
-/// appears:
-///   - `GpuDevice::renderer: Option<GlesRenderer>` becomes something like
-///     `Option<MultiRenderer<GbmGlesBackend<GlesRenderer>,
-///     GbmGlesBackend<GlesRenderer>>>` bound to a shared `GpuManager` that
-///     owns one `GbmGlesBackend` per detected DRM node (not just the
-///     primary).
-///   - `render_udev`'s `state.space.render_elements_for_output(renderer,
-///     ..)` call stays source-compatible (both types impl smithay's
-///     `Renderer` trait) but any buffer import prior to that
-///     (`renderer.import_dmabuf(...)`) needs to go through the
-///     `MultiRenderer`, which internally detects the source GPU from the
-///     dmabuf's originating device node and performs the copy.
-///   - `create_gles_renderer()` becomes "create/reuse a `GpuManager` +
-///     register every `DrmNode` found by `all_gpus()`/hotplug with it",
-///     rather than one independent EGL context per `GpuDevice`.
-/// Given the size of that change, it's intentionally left as a follow-up
-/// rather than attempted inline here — see ROADMAP.md.
+/// The lifecycle infrastructure for this is implemented — see
+/// `render/multigpu.rs`'s module doc for the details: `UdevData::
+/// gpu_manager` (a `smithay::backend::renderer::multigpu::GpuManager`) is
+/// kept in sync with every GPU node this compositor opens or loses, and
+/// `render::multigpu::import_from_other_gpu()` is a real, callable
+/// cross-GPU dmabuf import primitive built on it. What's *not* yet done
+/// is having anything actually call that function during normal
+/// rendering: `render_udev` still renders each output with a single
+/// per-GPU `GlesRenderer` (`GpuDevice::renderer`) for every element in
+/// one bulk `space.render_elements_for_output(...)` call, and nothing
+/// currently detects, per surface, whether that surface's current buffer
+/// was allocated on a different node than the output being drawn to.
+/// Wiring that in means either pre-warming the per-surface texture cache
+/// from the buffer-commit handler when a cross-GPU mismatch is detected,
+/// or restructuring the render pass to pick a renderer per element
+/// instead of once per frame — both real, scoped follow-ups, neither
+/// attempted here since both touch the render/commit hot path, which is
+/// exactly what most needs a real `cargo build` and a second GPU to
+/// verify against (see ROADMAP.md).
 pub struct OutputRenderSurface {
     pub output: Output,
     pub gbm_surface: smithay::backend::drm::GbmBufferedSurface<
@@ -179,6 +186,9 @@ pub struct WinitData {
     >,
     pub output: Output,
     pub damage_tracker: smithay::backend::renderer::damage::OutputDamageTracker,
+    /// See `GpuDevice::hdr_tonemap_shader` (udev path) — same purpose,
+    /// compiled against winit's single `GlesRenderer` context instead.
+    pub hdr_tonemap_shader: Option<smithay::backend::renderer::gles::GlesTexProgram>,
 }
 
 // ── Multi-monitor configuration ────────────────────────────────────────────
@@ -247,6 +257,40 @@ pub struct BlueState {
     /// lets an actual input-method client (e.g. a CJK IME, an on-screen
     /// keyboard) attach to the seat and drive text-input clients.
     pub input_method_manager_state: InputMethodManagerState,
+    /// Live IME candidate-window popups — see protocols/input_method.rs.
+    /// Previously `new_popup`/`dismiss_popup` were empty stubs, so an
+    /// IME's popup surface existed on the wire but was never tracked or
+    /// composited anywhere; this is what makes it actually visible.
+    pub input_method_popups: Vec<crate::protocols::input_method::TrackedImePopup>,
+    /// `zwp_linux_dmabuf_v1` — see protocols/dmabuf.rs. `None` until
+    /// `protocols::dmabuf::init_dmabuf` runs (needs a bound renderer, so
+    /// it can't happen inside `BlueState::new()` like most other globals
+    /// here — it's called once the winit/udev backend has a renderer).
+    pub dmabuf_state: Option<smithay::wayland::dmabuf::DmabufState>,
+    pub dmabuf_global: Option<smithay::wayland::dmabuf::DmabufGlobal>,
+    /// `wp_color_management_v1` — see protocols/color_management.rs.
+    pub color_management_state: crate::protocols::color_management::ColorManagementState,
+    /// Which DRM render node each surface's current buffer was allocated
+    /// on, when known (dmabuf-backed buffers only — shm buffers have no
+    /// GPU origin to track). Kept up to date by `render::multigpu::
+    /// track_surface_origin`, called from `CompositorHandler::commit`.
+    /// See `render/multigpu.rs`'s module doc for what this enables and
+    /// what still doesn't consume it.
+    pub surface_gpu_origin: HashMap<
+        smithay::reexports::wayland_server::backend::ObjectId,
+        smithay::backend::drm::DrmNode,
+    >,
+    /// Live layer-shell surfaces (panels, lock screen, on-screen
+    /// keyboards), keyed by their underlying `WlSurface`'s object id.
+    /// Kept around specifically so `layer_destroyed` can hand the *same*
+    /// `desktop::LayerSurface` wrapper instance back to `LayerMap::
+    /// unmap_layer` — see the long comment on `new_layer_surface` for
+    /// why a freshly-constructed wrapper wouldn't compare equal to the
+    /// one actually stored in the map.
+    pub layer_surfaces: HashMap<
+        smithay::reexports::wayland_server::backend::ObjectId,
+        smithay::desktop::LayerSurface,
+    >,
     /// `zwlr_foreign_toplevel_management_v1` — see protocols/foreign_toplevel.rs
     pub foreign_toplevel_state: crate::protocols::foreign_toplevel::ForeignToplevelManagerState,
     /// `zwlr_output_management_v1` — see protocols/output_management.rs
@@ -406,6 +450,12 @@ impl BlueState {
             tablet_manager_state,
             text_input_manager_state,
             input_method_manager_state,
+            input_method_popups: Vec::new(),
+            dmabuf_state: None,
+            dmabuf_global: None,
+            color_management_state: crate::protocols::color_management::ColorManagementState::default(),
+            surface_gpu_origin: HashMap::new(),
+            layer_surfaces: HashMap::new(),
             foreign_toplevel_state,
             output_management_state,
             screencopy_state,
@@ -588,6 +638,16 @@ impl BlueState {
 
     // ── Window helpers ─────────────────────────────────────────────────────
 
+    /// Convenience wrapper around `ipc::socket::broadcast` for call sites
+    /// (e.g. `protocols/input_method.rs`) that only have a `&BlueState`/
+    /// `&mut BlueState`, not the separately-threaded `Clients` handle —
+    /// avoids every new protocol module needing to import
+    /// `ipc::socket::Clients` and thread it through function signatures
+    /// just to emit one status message.
+    pub fn ipc_broadcast(&self, msg: crate::ipc::CompositorMessage) {
+        crate::ipc::broadcast(&self.clients, &msg);
+    }
+
     pub fn window_by_surface(&self, surface: &WlSurface) -> Option<Window> {
         self.space
             .elements()
@@ -714,6 +774,12 @@ impl CompositorHandler for BlueState {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        // Must run before `on_commit_buffer_handler` below — that call
+        // is what consumes/clears the surface's pending buffer
+        // assignment, so this is the last point at which the just-
+        // attached buffer (and therefore its dmabuf origin node, if any)
+        // is still inspectable. See render/multigpu.rs's module doc.
+        crate::render::multigpu::track_surface_origin(&mut self.surface_gpu_origin, surface);
         smithay::backend::renderer::utils::on_commit_buffer_handler::<Self>(surface);
         if let Some(window) = self.window_by_surface(surface) {
             window.on_commit();
@@ -864,14 +930,64 @@ impl WlrLayerShellHandler for BlueState {
 
     fn new_layer_surface(
         &mut self,
-        _surface: WlrLayerSurface,
-        _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+        surface: WlrLayerSurface,
+        output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
         _layer: Layer,
-        _namespace: String,
+        namespace: String,
     ) {
+        // Was a pure no-op — the global was registered but nothing ever
+        // called `map_layer`, so a layer-shell client's surface (panels,
+        // the lock screen's password prompt, on-screen keyboards) never
+        // actually got placed on an output or rendered.
+        //
+        // Two real `cargo build` errors fixed here vs. the previous pass:
+        //   - `from_resource` lives on `Output` itself, not
+        //     `OutputManagerState` (E0599 — confirmed against smithay
+        //     source: it's defined in `impl Output { .. }` in
+        //     src/output.rs, a couple methods away from `create_global`,
+        //     which is presumably why it got mis-attributed).
+        //   - `LayerMap::map_layer`/`unmap_layer` take
+        //     `&smithay::desktop::LayerSurface` (a wrapper that also
+        //     carries the namespace + a map-assigned id), NOT the raw
+        //     `smithay::wayland::shell::wlr_layer::LayerSurface` this
+        //     handler receives — two different, same-named types
+        //     (E0308). The wrapper's `PartialEq` compares an id assigned
+        //     at construction time, not anything derived from the
+        //     underlying surface, so a *fresh* wrapper built later in
+        //     `layer_destroyed` would never equal this one — the wrapper
+        //     has to be kept around (`self.layer_surfaces`, keyed by the
+        //     underlying `WlSurface`'s object id) so `layer_destroyed`
+        //     can hand back the *same* instance for removal.
+        use smithay::reexports::wayland_server::Resource;
+        let output = output
+            .as_ref()
+            .and_then(Output::from_resource)
+            .or_else(|| self.outputs.first().cloned());
+        let Some(output) = output else {
+            warn!("new layer surface (namespace {namespace}) but no output to map it on");
+            return;
+        };
+        let key = surface.wl_surface().id();
+        let desktop_layer = smithay::desktop::LayerSurface::new(surface, namespace.clone());
+        {
+            let mut map = layer_map_for_output(&output);
+            if let Err(e) = map.map_layer(&desktop_layer) {
+                warn!("failed to map layer surface (namespace {namespace}): {e:?}");
+                return;
+            }
+        }
+        self.layer_surfaces.insert(key, desktop_layer);
     }
 
-    fn layer_destroyed(&mut self, _surface: WlrLayerSurface) {}
+    fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        use smithay::reexports::wayland_server::Resource;
+        let key = surface.wl_surface().id();
+        if let Some(desktop_layer) = self.layer_surfaces.remove(&key) {
+            for output in &self.outputs {
+                layer_map_for_output(output).unmap_layer(&desktop_layer);
+            }
+        }
+    }
 }
 
 impl SelectionHandler for BlueState {
@@ -960,20 +1076,24 @@ delegate_tablet_manager!(BlueState);
 delegate_text_input_manager!(BlueState);
 
 impl InputMethodHandler for BlueState {
-    fn new_popup(&mut self, _surface: smithay::wayland::input_method::PopupSurface) {
-        // An IME requested a candidate-window popup (e.g. a CJK candidate
-        // list). Positioning it relative to the text cursor needs the
-        // text-input's cursor-rectangle hint, which isn't tracked on
-        // BlueState yet — follow-up.
+    fn new_popup(&mut self, surface: smithay::wayland::input_method::PopupSurface) {
+        // Was a no-op stub — see protocols/input_method.rs module doc.
+        // The IME's popup surface now gets tracked, positioned under the
+        // text cursor, and composited (render/mod.rs).
+        crate::protocols::input_method::popup_created(self, surface);
     }
 
-    fn dismiss_popup(&mut self, _surface: smithay::wayland::input_method::PopupSurface) {}
-
-    fn parent_geometry(&self, _surface: &WlSurface) -> Rectangle<i32, Logical> {
-        Rectangle::default()
+    fn dismiss_popup(&mut self, surface: smithay::wayland::input_method::PopupSurface) {
+        crate::protocols::input_method::popup_dismissed(self, &surface);
     }
 
-    fn popup_repositioned(&mut self, _surface: smithay::wayland::input_method::PopupSurface) {}
+    fn parent_geometry(&self, surface: &WlSurface) -> Rectangle<i32, Logical> {
+        crate::protocols::input_method::parent_geometry(self, Some(surface))
+    }
+
+    fn popup_repositioned(&mut self, surface: smithay::wayland::input_method::PopupSurface) {
+        crate::protocols::input_method::popup_repositioned(self, &surface);
+    }
 }
 delegate_input_method_manager!(BlueState);
 
