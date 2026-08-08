@@ -11,6 +11,7 @@ use smithay::{
                 surface::WaylandSurfaceRenderElement,
             },
             gles::GlesRenderer,
+            multigpu::{gbm::GbmGlesBackend, GpuManager},
             Bind,
         },
         session::{Session, libseat::LibSeatSession},
@@ -30,11 +31,21 @@ use tracing::{error, info, warn};
 
 use crate::state::{BackendData, BlueState, GpuDevice, OutputRenderSurface, UdevData, WinitData};
 
+/// Multi-GPU render-node import (hybrid-graphics laptops) — see module
+/// doc for what's implemented (GpuManager lifecycle + the cross-copy
+/// primitive) vs. what's still an open follow-up (per-surface origin
+/// tracking to actually call it from the render loop).
+pub mod multigpu;
+
+/// HDR tone-mapping shader (compiled, not yet wired into the composite
+/// pass — see module doc for exactly why and what's left).
+pub mod hdr_shader;
+
 // ── Winit (nested/dev mode) ───────────────────────────────────────────────
 
 pub fn init_winit(
     state: &mut BlueState,
-    backend: WinitGraphicsBackend<GlesRenderer>,
+    mut backend: WinitGraphicsBackend<GlesRenderer>,
     events: WinitEventLoop,
     loop_handle: &LoopHandle<'static, BlueState>,
 ) {
@@ -55,7 +66,29 @@ pub fn init_winit(
     state.space.map_output(&output, Point::from((0, 0)));
     let damage_tracker = OutputDamageTracker::from_output(&output);
     state.outputs.push(output.clone());
-    state.backend_data = BackendData::Winit(Box::new(WinitData { backend, output, damage_tracker }));
+
+    // Register the client-facing dmabuf + color-management globals now
+    // that a real GlesRenderer exists (`WinitGraphicsBackend::renderer()`
+    // — a plain accessor, doesn't consume/move `backend`). Doing this
+    // under winit (not just udev) is what makes both testable without
+    // real DRM hardware — e.g. `build.rb check`'s headless smoke test.
+    {
+        let display_handle = state.display_handle.clone();
+        let (dmabuf_state, dmabuf_global) =
+            crate::protocols::dmabuf::init_dmabuf(&display_handle, backend.renderer(), None);
+        state.dmabuf_state = Some(dmabuf_state);
+        state.dmabuf_global = dmabuf_global;
+        state.color_management_state = crate::protocols::color_management::init_color_management(&display_handle);
+    }
+    let hdr_tonemap_shader = match hdr_shader::compile_hdr_tonemap_shader(backend.renderer()) {
+        Ok(program) => Some(program),
+        Err(e) => {
+            warn!("HDR tone-mapping shader failed to compile (not fatal — HDR content just won't be tone-mapped): {e:?}");
+            None
+        }
+    };
+
+    state.backend_data = BackendData::Winit(Box::new(WinitData { backend, output, damage_tracker, hdr_tonemap_shader }));
     state.seat.add_keyboard(smithay::input::keyboard::XkbConfig::default(), 400, 30).expect("keyboard");
     let _ = state.seat.add_pointer();
 
@@ -99,9 +132,17 @@ pub fn render_winit(state: &mut BlueState, output: &Output) {
         // advertised. Pull the output's real (possibly fractional) scale
         // instead.
         let output_scale = output.current_scale().fractional_scale() as f32;
-        let elems: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
+        let mut elems: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
             state.space.render_elements_for_output(renderer, output, output_scale)
                 .unwrap_or_default();
+        // IME candidate-window popups aren't part of `state.space` (they
+        // aren't xdg-shell windows), so `render_elements_for_output`
+        // never picks them up — this is the composite half of the fix in
+        // protocols/input_method.rs (positioning was the other half).
+        elems.extend(crate::protocols::input_method::render_elements(
+            &state.input_method_popups, renderer, output_scale as f64,
+        ));
+        elems.extend(layer_shell_elements(output, renderer, output_scale as f64));
         elems
     };
 
@@ -140,14 +181,24 @@ pub fn init_udev(
 
     let udev_backend = UdevBackend::new(&seat_name).expect("udev backend");
     let mut devices: HashMap<DrmNode, GpuDevice> = HashMap::new();
+    // See render/multigpu.rs's module doc — this is registered with
+    // every GPU node below (and on hotplug `UdevEvent::Added`/
+    // `Removed`), independent of whether a second GPU is actually
+    // present, so the infra is always correct/ready rather than only
+    // exercised on hybrid-graphics hardware.
+    let mut gpu_manager = GpuManager::new(GbmGlesBackend::default())
+        .expect("GpuManager::new is infallible for GbmGlesBackend (no devices enumerated yet)");
 
     if let Ok((gpu, notifier)) = open_gpu(&primary_node, &mut session) {
+        if let Err(e) = gpu_manager.as_mut().add_node(primary_node, gpu.gbm.clone()) {
+            warn!("multi-gpu: failed to register primary GPU {primary_node:?} with GpuManager: {e:?}");
+        }
         devices.insert(primary_node, gpu);
         register_drm_notifier(loop_handle, primary_node, notifier);
     }
 
     state.backend_data = BackendData::Udev(Box::new(UdevData {
-        session, primary_gpu: primary_node, devices,
+        session, primary_gpu: primary_node, devices, gpu_manager,
     }));
     // scan_drm_outputs needs backend_data populated first (it looks the
     // GpuDevice up by node to create the renderer/surfaces), so this runs
@@ -184,6 +235,9 @@ pub fn init_udev(
                     if let BackendData::Udev(ref mut data) = state.backend_data {
                         let mut sess = data.session.clone();
                         if let Ok((gpu, notifier)) = open_gpu(&node, &mut sess) {
+                            if let Err(e) = data.gpu_manager.as_mut().add_node(node, gpu.gbm.clone()) {
+                                warn!("multi-gpu: failed to register hotplugged GPU {node:?} with GpuManager: {e:?}");
+                            }
                             data.devices.insert(node, gpu);
                             // Previously dropped for hotplugged GPUs (only
                             // the primary GPU's notifier, opened before
@@ -224,6 +278,12 @@ pub fn init_udev(
                             gpu.surfaces.clear();
                         }
                         udev.devices.remove(&node);
+                        // Keep GpuManager in sync — an internal texture
+                        // cache entry pointing at a now-closed device fd
+                        // would otherwise be a use-after-free risk the
+                        // next time something tried a cross-GPU import
+                        // involving this node (see render/multigpu.rs).
+                        udev.gpu_manager.as_mut().remove_node(&node);
                     }
                     for output in removed_outputs {
                         state.space.unmap_output(&output);
@@ -303,7 +363,7 @@ fn open_gpu(
         .map_err(|e| format!("DrmDevice: {}", e))?;
     let gbm = GbmDevice::new(drm_fd)
         .map_err(|e| format!("GbmDevice: {}", e))?;
-    Ok((GpuDevice { drm, gbm, renderer: None, surfaces: HashMap::new() }, notifier))
+    Ok((GpuDevice { drm, gbm, renderer: None, hdr_tonemap_shader: None, surfaces: HashMap::new() }, notifier))
 }
 
 /// Detects connected outputs on a DRM device AND (unlike the previous
@@ -330,12 +390,13 @@ fn open_gpu(
 /// either way, but plan to `cargo build` and iterate before shipping it.
 ///
 /// Single-CRTC-per-connector, no explicit plane management beyond what
-/// `GbmBufferedSurface`/`DrmSurface` do internally, and no output
-/// hotplug-aware surface teardown yet (see `UdevEvent::Removed` in
-/// `init_udev`, still a no-op) — multi-GPU render-node import (copying a
-/// client's buffer from a secondary GPU to the primary one) is also not
-/// handled, so clients bound to a non-primary GPU may not render at all
-/// on hybrid-graphics laptops.
+/// `GbmBufferedSurface`/`DrmSurface` do internally. Two gaps this comment
+/// used to list here have since been addressed elsewhere: hotplug-aware
+/// surface teardown (`UdevEvent::Removed` in `init_udev`) turned out to
+/// already be implemented when actually checked, and multi-GPU
+/// render-node import lifecycle now exists (`render/multigpu.rs`) — what
+/// remains for the latter is per-surface origin routing, not the
+/// infrastructure itself; see ROADMAP.md for both.
 fn scan_drm_outputs(
     state: &mut BlueState,
     drm: &mut DrmDevice,
@@ -349,7 +410,17 @@ fn scan_drm_outputs(
         if let Some(gpu) = udev.devices.get_mut(&node) {
             if gpu.renderer.is_none() {
                 match create_gles_renderer(&gpu.gbm) {
-                    Ok(r) => { gpu.renderer = Some(r); true }
+                    Ok(mut r) => {
+                        gpu.hdr_tonemap_shader = match hdr_shader::compile_hdr_tonemap_shader(&mut r) {
+                            Ok(program) => Some(program),
+                            Err(e) => {
+                                warn!("HDR tone-mapping shader failed to compile for {:?} (not fatal — HDR content just won't be tone-mapped): {e:?}", node);
+                                None
+                            }
+                        };
+                        gpu.renderer = Some(r);
+                        true
+                    }
                     Err(e) => { error!("Failed to create EGL/GLES renderer for {:?}: {}", node, e); false }
                 }
             } else {
@@ -363,6 +434,37 @@ fn scan_drm_outputs(
     };
     if !renderer_ready {
         warn!("No renderer available for GPU {:?}, outputs on it will not render", node);
+    } else if state.dmabuf_state.is_none() {
+        // First GPU with a working renderer: register the client-facing
+        // dmabuf + color-management globals (see protocols/dmabuf.rs,
+        // protocols/color_management.rs). Only done once — multi-GPU
+        // per-device feedback (advertising a different `main_device`
+        // tranche per render node) is the multi-GPU follow-up already
+        // flagged above, not attempted here.
+        let display_handle = state.display_handle.clone();
+        // `DrmNode::dev_id()` returns `u64` directly, not a `Result` —
+        // confirmed by a real `cargo build` error (`E0599: no method
+        // named 'ok' found for type 'u64'`) once this was actually
+        // compiled; `libc::dev_t` is a plain alias for `u64` on Linux,
+        // so no cast is needed either.
+        let dev_id = Some(node.dev_id());
+
+        let init_result = if let BackendData::Udev(ref udev) = state.backend_data {
+            udev.devices.get(&node)
+                .and_then(|gpu| gpu.renderer.as_ref())
+                .map(|renderer| crate::protocols::dmabuf::init_dmabuf(&display_handle, renderer, dev_id))
+        } else {
+            None
+        };
+        // Borrow of `state.backend_data` (via `udev`/`gpu`/`renderer`)
+        // ends at the close of the `if let` above, so assigning back into
+        // `state` here is a fresh, disjoint borrow — same reasoning as
+        // `dmabuf::init_dmabuf`'s doc comment.
+        if let Some((dmabuf_state, dmabuf_global)) = init_result {
+            state.dmabuf_state = Some(dmabuf_state);
+            state.dmabuf_global = dmabuf_global;
+            state.color_management_state = crate::protocols::color_management::init_color_management(&display_handle);
+        }
     }
 
     let mut used_crtcs: Vec<crtc::Handle> = Vec::new();
@@ -607,6 +709,47 @@ fn create_gles_renderer(
 /// map instead of `WinitGraphicsBackend`, and pushes the result through
 /// `GbmBufferedSurface::queue_buffer()` for an atomic pageflip instead of
 /// `WinitGraphicsBackend::submit()`.
+/// Render elements for every mapped layer-shell surface on `output`
+/// (panels, the lock screen, on-screen keyboards, ...). Was previously
+/// nothing — `new_layer_surface`/`layer_destroyed` in state/mod.rs were
+/// no-ops, so nothing was ever mapped into smithay's `LayerMap` in the
+/// first place; this is the composite-side half of that fix, same
+/// relationship as `input_method::render_elements` is to the IME popup
+/// positioning fix.
+fn layer_shell_elements<R, E>(
+    output: &Output,
+    renderer: &mut R,
+    scale: f64,
+) -> Vec<E>
+where
+    R: smithay::backend::renderer::Renderer + smithay::backend::renderer::ImportAll,
+    R::TextureId: Clone + 'static,
+    E: From<smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement<R>>,
+{
+    use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
+    use smithay::desktop::layer_map_for_output;
+
+    let map = layer_map_for_output(output);
+    let mut out = Vec::new();
+    for layer in map.layers() {
+        let wl_surface = layer.wl_surface();
+        let Some(geo) = map.layer_geometry(layer) else { continue };
+        let phys = smithay::utils::Point::<i32, smithay::utils::Physical>::from((
+            (geo.loc.x as f64 * scale).round() as i32,
+            (geo.loc.y as f64 * scale).round() as i32,
+        ));
+        out.extend(render_elements_from_surface_tree(
+            renderer,
+            wl_surface,
+            phys,
+            scale,
+            1.0,
+            smithay::backend::renderer::element::Kind::Unspecified,
+        ));
+    }
+    out
+}
+
 pub fn render_udev(state: &mut BlueState, node: DrmNode, crtc: crtc::Handle) {
     let BackendData::Udev(ref mut udev) = state.backend_data else { return };
     let Some(gpu) = udev.devices.get_mut(&node) else { return };
@@ -616,9 +759,13 @@ pub fn render_udev(state: &mut BlueState, node: DrmNode, crtc: crtc::Handle) {
     let output_scale = surface.output.current_scale().fractional_scale() as f32;
 
     use smithay::desktop::space::SpaceRenderElements;
-    let elements: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
+    let mut elements: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
         state.space.render_elements_for_output(renderer, &surface.output, output_scale)
             .unwrap_or_default();
+    elements.extend(crate::protocols::input_method::render_elements(
+        &state.input_method_popups, renderer, output_scale as f64,
+    ));
+    elements.extend(layer_shell_elements(&surface.output, renderer, output_scale as f64));
 
     let mode_size = surface.output.current_mode().map(|m| m.size).unwrap_or(Size::from((0, 0)));
 
